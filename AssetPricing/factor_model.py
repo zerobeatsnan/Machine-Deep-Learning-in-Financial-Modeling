@@ -6,6 +6,19 @@ import gc
 from tqdm import trange
 from datetime import datetime
 import warnings
+import numpy as np
+import pandas as pd
+from tqdm import trange
+import sklearn.metrics.pairwise as kernel
+from copy import copy
+import statsmodels.api as sm
+import gc
+from sklearn.manifold import TSNE
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt 
+from sklearn.model_selection import train_test_split
+import math
+from sklearn.mixture import GaussianMixture
 
 warnings.filterwarnings('ignore', message = 'Unused variable')
 
@@ -319,4 +332,169 @@ class IPCA():
 
     def predict(self,zt):
         mu = self.ft.mean(skipna=True).values.reshape(self.k, 1)
+        return zt.dot(self.gamma).dot(mu)[0]
+
+#==========================
+# KERNEL IPCA
+#==========================
+class KERNEL_IPCA():
+    def __init__(self,characteristics,ret, n_freedom = None, kernel_method = None, **kwargs):
+
+        self.n_free = n_freedom
+        self.kernel_met = kernel_method
+        self.kernel_params = kwargs
+        self.date_list=list(characteristics.keys())
+
+        if self.n_free != None:
+
+            data = pd.concat([characteristics[i] for i in self.date_list], axis = 0)
+
+            char_array = data.values
+
+            n_clusters = self.n_free
+
+            kmeans = KMeans(n_clusters = n_clusters)
+
+            kmeans.fit(char_array)
+
+            print("clustering finish")
+
+            self.centers = kmeans.cluster_centers_
+
+            if self.kernel_met == "linear_kernel":
+
+                kernel_use = kernel.linear_kernel
+            
+            elif self.kernel_met == "polynomial_kernel":
+
+                kernel_use = kernel.polynomial_kernel
+
+            elif self.kernel_met == "rbf_kernel":
+
+                kernel_use = kernel.rbf_kernel
+
+            elif self.kernel_met == "sigmoid_kernel":
+
+                kernel_use = kernel.sigmoid_kernel
+
+
+            _characteristics = copy(characteristics)
+
+            for i in trange(len(self.date_list)):
+
+                t = self.date_list[i]
+
+                centers = self.centers
+                index = _characteristics[t].index
+                gram_train = kernel_use(_characteristics[t],centers, **self.kernel_params)
+                gram_use = pd.DataFrame(gram_train,index = index, columns = [f"Feature{i}" for i in range(1,n_clusters + 1)])
+                characteristics[t] = gram_use
+
+        self.characteristics=copy(characteristics)
+        self.ret=copy(ret)
+        self.stock_list=list(self.ret.columns)
+        self.Nt=dict(zip(
+            self.date_list,
+            [self.characteristics[i].shape[0] for i in self.date_list]
+        ))
+        self.chanames=list(self.characteristics[self.date_list[0]].columns)
+        self.l=len(self.chanames)
+        # self.kernel
+        
+        # for each t, it l*N_t * N_t * 1
+        self.xt=pd.DataFrame(np.nan,index=self.date_list,columns=self.chanames)
+        for t in self.date_list:
+            self.xt.loc[t]=self.characteristics[t].T.dot(self.ret.loc[t,self.characteristics[t].index])
+        # z_t square is l*N_t * N_t*l
+        self.zt_square=dict(zip(
+            self.date_list,
+            [self.characteristics[i].T.dot(self.characteristics[i]) for i in self.date_list]
+        ))
+        self.error_ls = []
+        
+        gc.collect()
+    
+    def fit(self,k,maxT=1000,tol=1e-3):
+        self.k=k
+        eigvalue,eigvector=np.linalg.eig(self.xt.T.dot(self.xt))
+        self.gamma=eigvector[:,:self.k]
+        
+        def calc_ft(zt_square,xt,gamma):
+            gamma_zts=gamma.T.dot(zt_square).dot(gamma)
+            if np.linalg.det(gamma_zts)>0:
+                ft=np.linalg.inv(gamma_zts).dot(gamma.T).dot(xt)
+                return ft
+            else:
+                pass
+
+
+        def calc_error(characteristics, date_list, ret, ft, gamma, k):
+
+            total_error = 0
+
+            for t in date_list:
+
+                x = characteristics[t].dot(gamma).dot(ft.loc["1963-01-31"].values.reshape(k,1)).values.squeeze()
+
+                y = ret.loc[t, characteristics[t].index].values
+
+                error = np.linalg.norm(x-y)**2
+
+                total_error = total_error + error
+
+            return total_error
+
+
+
+        def calc_denomt(ft,zt_square):
+            return np.kron(ft.dot(ft.T),zt_square)
+
+        def calc_numert(ft,xt):
+            return np.kron(ft,xt)
+
+        def calc_gamma(ft):
+            denom=np.zeros((self.k*self.l,self.k*self.l))
+            numer=np.zeros((self.k*self.l,1))
+            for t in self.date_list:
+                ft_=ft.loc[t].values.reshape(self.k,1)
+                if ft.loc[t].sum()!=0:
+                    denom=denom+calc_denomt(ft_,self.zt_square[t])
+                    numer=numer+calc_numert(ft_,self.xt.loc[t].values.reshape(self.l,1))
+            if np.linalg.det(denom)>0:
+                gamma=np.linalg.inv(denom).dot(numer)
+            else:
+                gamma=np.linalg.pinv(denom).dot(numer)
+            gamma=gamma.reshape(self.k,self.l).T
+            return gamma
+        
+        for i in trange(maxT):
+            self.ft=pd.DataFrame(np.nan,index=self.date_list,columns=['PC'+str(i) for i in range(1,self.k+1)])
+            for t in self.date_list:
+                self.ft.loc[t]=calc_ft(self.zt_square[t],self.xt.loc[t],self.gamma)
+
+            gamma_=copy(self.gamma)
+            self.gamma=calc_gamma(self.ft)
+
+            total_error = calc_error(self.characteristics, self.date_list, self.ret, self.ft, self.gamma, self.k)
+
+            # print(f"The total error after round {i} is :", total_error)
+
+            error=((self.gamma-gamma_)**2).sum()
+
+            self.error_ls.append(total_error)
+            if error<=tol:
+                break
+            # else:
+            #     print('round {}, error: {}'.format(i+1,error))
+
+        Chol=np.linalg.cholesky(self.gamma.T.dot(self.gamma)).T
+        fcov=self.ft.dropna().T.dot(self.ft.dropna())/self.ft.shape[0]
+        eigvalue,Orth=np.linalg.eig(Chol.dot(fcov).dot(Chol.T))
+        self.gamma=self.gamma.dot(np.linalg.inv(Chol)).dot(Orth)
+        self.ft=self.ft.dot(Chol.T).dot(Orth)
+        self.ft.columns=['PC'+str(i) for i in range(1,self.k+1)]
+        gc.collect()
+        
+    def predict(self,zt):
+        mu=self.ft.mean(skipna=True).values.reshape(self.k,1)
         return zt.dot(self.gamma).dot(mu)[0]
